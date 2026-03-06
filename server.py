@@ -486,13 +486,15 @@ def make_app() -> Starlette:
                 mcp_server.create_initialization_options()
             )
 
+    async def handle_messages(request):
+        await sse.handle_post_message(request.scope, request.receive, request._send)
+
     return Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
+            Route("/messages/", endpoint=handle_messages, methods=["POST"]),
         ]
     )
-
 
 # ---------------------------------------------------------------------------
 # Entry point
