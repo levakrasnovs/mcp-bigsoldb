@@ -23,6 +23,8 @@ from mcp.types import (
     TextContent,
     Tool,
 )
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
@@ -31,6 +33,7 @@ from starlette.routing import Mount, Route
 # ---------------------------------------------------------------------------
 
 DB: list[dict] = []
+FP_INDEX: list[tuple[Any, object]] = []  # (record, fingerprint)
 
 
 def load_db(csv_path: str) -> None:
@@ -48,6 +51,22 @@ def load_db(csv_path: str) -> None:
                     row[key] = None
             DB.append(row)
     print(f"Loaded {len(DB):,} records.")
+
+
+def build_fp_index() -> None:
+    global FP_INDEX
+    print("Building Morgan fingerprint index…")
+    FP_INDEX = []
+    for r in DB:
+        smi = r.get("SMILES_Solute", "")
+        if not smi:
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=2, nBits=2048)
+        FP_INDEX.append((r, fp))
+    print(f"Fingerprint index: {len(FP_INDEX):,} entries.")
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +273,35 @@ async def list_tools() -> ListToolsResult:
                 }
             }
         ),
+
+        Tool(
+            name="search_by_similarity",
+            description=(
+                "Find compounds in BigSolDB structurally similar to a query SMILES "
+                "using Morgan fingerprints (Tanimoto similarity). "
+                "Returns the top-N most similar unique compounds with their solubility data."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "smiles": {
+                        "type": "string",
+                        "description": "Query SMILES string"
+                    },
+                    "threshold": {
+                        "type": "number",
+                        "description": "Minimum Tanimoto similarity (0.0–1.0), default 0.4",
+                        "default": 0.4
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Max number of similar compounds to return (default 10)",
+                        "default": 10
+                    }
+                },
+                "required": ["smiles"]
+            }
+        ),
     ])
 
 
@@ -381,6 +429,43 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
             return text("No FDA-approved records found with the given filters.")
         return text(fmt_results(results, limit))
 
+    # ---- search_by_similarity ----
+    elif name == "search_by_similarity":
+        smiles = arguments["smiles"].strip()
+        threshold = float(arguments.get("threshold", 0.4))
+        top_n = int(arguments.get("top_n", 10))
+
+        query_mol = Chem.MolFromSmiles(smiles)
+        if query_mol is None:
+            return text(f"Invalid SMILES: '{smiles}'")
+
+        query_fp = AllChem.GetMorganFingerprintAsBitVect(query_mol, radius=2, nBits=2048)
+
+        scored = []
+        seen_smiles = set()
+        for r, fp in FP_INDEX:
+            sim = DataStructs.TanimotoSimilarity(query_fp, fp)
+            if sim >= threshold:
+                smi = r.get("SMILES_Solute", "")
+                if smi not in seen_smiles:
+                    seen_smiles.add(smi)
+                    scored.append((sim, r))
+
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:top_n]
+
+        if not top:
+            return text(f"No compounds found with Tanimoto ≥ {threshold}.")
+
+        lines = [f"Top {len(top)} similar compounds (Tanimoto ≥ {threshold}):\n"]
+        for sim, r in top:
+            rec = record_to_dict(r)
+            lines.append(
+                f"  [{sim:.3f}] {rec.get('compound_name') or rec.get('smiles_solute')} "
+                f"| SMILES: {rec.get('smiles_solute')}"
+            )
+        return text("\n".join(lines))
+
     else:
         return text(f"Unknown tool: {name}")
 
@@ -425,6 +510,7 @@ def main():
     args = parser.parse_args()
 
     load_db(args.csv)
+    build_fp_index()
     app = make_app()
     print(f"BigSolDB MCP server running at http://{args.host}:{args.port}/sse")
     uvicorn.run(app, host=args.host, port=args.port)
